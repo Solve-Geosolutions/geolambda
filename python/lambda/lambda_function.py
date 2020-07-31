@@ -2,52 +2,98 @@ import os
 import subprocess
 import sys
 import logging
+import uuid
+from urllib.parse import unquote_plus
 
 # set up logger
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.DEBUG)
-# commented out to avoid duplicate logs in lambda
-# logger.addHandler(logging.StreamHandler())
 
-# imports used for the example code below
-from osgeo import gdal
+# imports for actual work
+os.environ['PROJ_LIB'] = '/python/pyproj/proj_dir/share/proj'
 
-# not used in code below, but imported to test loading of libraries
 import rasterio
-import pyproj
-import shapely
+import rasterio.mask
+import boto3
+import numpy as np
+from pyproj import Proj, transform
+import fiona
+from fiona.crs import from_epsg
 
+# imports to unzip shp:
+import json
+import zipfile
 
-test_filename = 'https://landsat-pds.s3.amazonaws.com/c1/L8/086/240/LC08_L1GT_086240_20180827_20180827_01_RT/LC08_L1GT_086240_20180827_20180827_01_RT_B1.TIF'
+s3_client = boto3.client('s3')
 
-
-def lambda_handler(event, context=None):
+# reproject the shape file
+def lambda_handler(event, context):
     """ Lambda handler """
-    logger.debug(event)
+    logger.debug(event) # if logging needed
+    # logger.info()
+    
+    # register the event
+    for record in event['Records']:
+        bucket = record['s3']['bucket']['name']
+        key = unquote_plus(record['s3']['object']['key'])
+        tmpkey = key.replace('/', '')
+        
+        dir_id = uuid.uuid4()
+        download_path = '/tmp/{}{}'.format(dir_id, tmpkey)
+        shp_path = '/tmp/{}/'.format(dir_id)
+        upload_path = '/tmp/{}/Landsat8-{}.tif'.format(dir_id, tmpkey.replace('.zip', ''))
+        
+        s3_client.download_file(bucket, key, download_path)
+        
+        # unzip the file
+        os.mkdir(shp_path)
+        with zipfile.ZipFile(download_path, "r") as zip_ref:
+            print(zip_ref)
+            zip_ref.extractall(shp_path)
+            
+        # file_loc = name of .shp file in the unzipped directory, take the first one
+        file_loc = [f for f in os.listdir(shp_path) if f.endswith('.shp')][0]
+        logger.debug([f for f in os.listdir(shp_path) if f.endswith('.shp')]) # if logging needed
+        
+        # load shape file
+        shape = fiona.open(os.path.join(shp_path, file_loc))
+        original = Proj(shape.crs)
+        destination = Proj('EPSG:3577')
+        
+        # reproject to EPSG:3577
+        for feat in shape: # feat = one polygon of the shapefile
+            out_linearRing = [] # empty list for the LinearRing of transformed coordinates
+            for point in feat['geometry']['coordinates'][0]: # LinearRing of the Polygon
+                long,lat =  point  # one point of the LinearRing
+                x,y = transform(original, destination,long,lat) # transform the point
+                out_linearRing.append((x,y)) # add all the points to the new LinearRing
+            # transform the resulting LinearRing to  a Polygon and write it
+            feat['geometry']['coordinates'] = [out_linearRing]
+        shapes = [feat['geometry']]
 
-    # this try block is for testing and info only,
-    # it prints out info on the the libgdal binary and paths to linked libraries
-    #try:
-    #    output = subprocess.check_output('readelf -d /opt/lib/libgdal.so'.split(' '))
-    #    logger.info(output.decode())
-    #    output = subprocess.check_output('ldd /opt/lib/libgdal.so'.split(' '))
-    #    logger.info(output.decode())
-    #except Exception as e:
-    #    pass
-
-    # process event payload and do something like this
-    fname = event.get('filename', test_filename)
-    fname = fname.replace('s3://', '/vsis3/')
-    # open and return metadata
-    ds = gdal.Open(fname)
-    band = ds.GetRasterBand(1)
-    stats = band.GetStatistics(0, 1)
-
-    return stats
-
-
-if __name__ == "__main__":
-    """ Test lambda_handler """
-    event = {'filename': test_filename}
-    stats = lambda_handler(event)
-    print(stats)
+        # clip raster
+        rasterio.Env(CPL_CURL_VERBOSE=True)
+        src = rasterio.open(f's3://solve-landsat8/landsat8_30y_merge_co.tif')
+        out_image, out_transform = rasterio.mask.mask(src, shapes, crop=True)
+        out_meta = src.meta
+        print("d")
+        
+        # save raster out
+        out_meta.update({"driver": "GTiff", "height": out_image.shape[1], "width": out_image.shape[2], "transform": out_transform})
+        dest = rasterio.open(upload_path, "w", **out_meta)
+        dest.write(out_image)
+        dest.close()
+        print("e")
+        
+        size = os.path.getsize(upload_path)
+        print(upload_path)
+        print('Size of file is', size, 'bytes')
+        
+        # put to S3
+        s3_client.upload_file(upload_path, 'solve-landsat8-input', 'Landsat8-{}.tif'.format(tmpkey.replace('.zip', '')))
+        print("f")
+        
+        return({
+            'status_code': 200,
+            'body': json.dumps('file is created in:'+upload_path)
+        })
